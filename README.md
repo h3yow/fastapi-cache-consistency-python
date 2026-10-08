@@ -1,44 +1,75 @@
 # fastapi-cache-consistency-python
 
-在读接口前加一层本地可复现的查询缓存，挡住重复的底层查询。
+在读接口前加一层本地可复现的查询缓存，挡住重复的底层查询。多个业务线共用同一份缓存时，
+支持按键互相隔离的熔断降级、可配置容量的 LRU 淘汰，以及固定可枚举的对外降级类别。
 
 ## 结构
 
-- `cache_layer/cache.py` — 缓存核心：`QueryCache`（TTL + 单飞回源）、`CircuitBreaker`（熔断降级）、`CacheResult`（结果与来源）。
+- `cache_layer/cache.py` — 缓存核心：`QueryCache`（TTL + 单飞回源 + 容量 LRU）、`CircuitBreaker`（单键熔断状态机）、`CacheResult`（结果与来源）、`DegradeReason`（对外降级类别）。
 - `cache_layer/backend.py` — `FakeBackend`：可编程延迟/故障的底层存储模拟，用于本地复现超时、连接失败与恢复。
 - `main.py` — FastAPI 读接口 `GET /items/{item_id}`，演示命中、回源与降级。
-- `tests/test_cache.py` — 并发回源、过期、空结果、底层异常四类行为测试。
+- `tests/test_cache.py` — 并发回源、过期、空结果、异常恢复、按键隔离、容量淘汰、降级类别与防泄露等行为测试。
 
 ## 读写语义
 
-`QueryCache.get(key)` 返回 `CacheResult(value, source, error)`，`source` 可区分四种情况：
+`QueryCache.get(key)` 返回 `CacheResult(value, source, error, reason)`，`source` 可区分四种情况：
 
 | source | 含义 |
 |---|---|
 | `hit` | 缓存命中（含空结果命中），不访问底层 |
 | `backend` | 本次请求真正触发了回源，并写入缓存 |
 | `joined` | 并发等待方，复用同一次回源结果 |
-| `degraded` | 底层不可用或熔断中，`error` 字段给出失败原因 |
+| `degraded` | 该键底层不可用或熔断中，`reason` 给出固定失败类别 |
 
 - 命中时绝不访问底层存储；未命中时回源并写入。
 - 同一键的并发请求合并为一次真实回源（单飞），等待方拿到同一次结果。
-- 回源失败**不写入缓存**，失败原因放在 `error` 字段，异常不向调用方透出。
+- 回源失败**不写入缓存**，异常不向调用方透出。
 
 ## 过期与空结果规则
 
 - 每条缓存带 TTL（`ttl` 秒）。过期后必须重新回源，绝不返回旧值。
-- 空结果用 `EMPTY` 哨兵写入缓存，与“没缓存”严格区分：空结果命中返回 `source=hit, value=None`，不会反复打底层。
+- 空结果用 `EMPTY` 哨兵写入缓存，与“没缓存”严格区分：空结果命中返回 `source=hit, value=None`，不会反复打底层。空结果条目被容量淘汰后，再访问会和第一次一样重新回源并重新缓存空结果。
 
-## 降级与恢复
+## 按键隔离的熔断与恢复
 
-- 底层超时（`load_timeout`）、连接失败等异常一律转为 `degraded` 结果，对外接口返回 503 + 失败原因，不透出异常。
-- `CircuitBreaker`：连续失败达到 `failure_threshold` 后断开，`cooldown` 秒内直接降级、不访问底层；冷却结束后半开放行一次试探，成功则闭合恢复，正常回源并重新写缓存。
+熔断器状态（失败计数、断开时刻、冷却、半开试探）**按 key 各自独立维护**，适用范围是
+`QueryCache` 实例内的所有缓存键：
+
+- 某个键连续失败达到 `failure_threshold` 后只断开该键：它在 `cooldown` 秒内直接降级、不访问底层；其他键该命中命中、该回源回源，互不阻挡。
+- 冷却结束后每个键各自进入半开、放行一次试探：试探成功该键独立闭合并重新写缓存；试探失败该键继续熔断，不影响其他键的恢复。
+- 多个键同一时间一起失败或一起恢复时，各自计数、各自计时，判定不会串。
+- 键恢复成功后其熔断状态会被清理；熔断状态本身不参与容量淘汰。
+
+## 容量与淘汰规则
+
+- `max_capacity`（条数，默认 `None` 表示不限制）限制缓存条目数，空结果条目也计数。
+- 装满后采用 **LRU（最近最少使用）**：命中会把该键标记为最近使用；新写入导致超容量时，
+  从最久未使用端逐条逐出，直到不超过上限。
+- 被淘汰的键下次访问按未命中处理，**正常重新回源**：不会返回过期旧值，也不会报错。
+- 正在并发回源（inflight）的键在缓存中没有条目，淘汰不会冲掉单飞合并；淘汰窗口内同键的
+  并发等待方仍然只触发一次回源并拿到同一次结果。
+
+## 对外降级类别
+
+`CacheResult.reason`（HTTP 层 503 响应的 `reason` 字段）只取以下**固定、可枚举**的值，
+不包含任何底层异常类型名、异常消息或调用栈：
+
+| reason | 含义 | 判定依据（内部日志会打全） |
+|---|---|---|
+| `timeout` | 回源超时 | `asyncio.wait_for` 超过 `load_timeout` |
+| `connectivity` | 连不上 / 底层不可用 | 回源抛出超时以外的任何异常 |
+| `circuit_open` | 请求被该键的熔断挡住 | 该键处于熔断冷却期内，未访问底层 |
+
+异常的具体类型、消息与调用栈只写入服务内部日志（`cache-layer` logger 的
+WARNING + `exc_info`），判定依据（阈值、冷却剩余、超时时间、淘汰键等）在日志中逐条记录。
 
 ## 本地验证
 
 ```bash
-uv run pytest -q --log-cli-level=INFO   # 单测日志打印键、命中/回源、耗时、判定依据
+uv run pytest -q --log-cli-level=INFO   # 单测日志逐条打印场景、键、来源、耗时与判定依据
 uv run python main.py                   # 启动服务后访问 GET /items/1
 ```
 
-接口返回的 `source` 字段可直接观察命中（`hit`）、回源（`backend`）与降级（503）。
+接口返回的 `source` 字段可直接观察命中（`hit`）、回源（`backend`）与降级（503 + 固定
+`reason`：`timeout` / `connectivity` / `circuit_open`）。
+
